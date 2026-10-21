@@ -1,0 +1,5 @@
+# @local/dsh-time-weaver bundle layer.
+# Mounted by adding this package to a profile
+- insert:
+    - id: time-weaver
+      name: './host.v8.js'

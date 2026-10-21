@@ -1,0 +1,15 @@
+# Dependencies / tooling
+node_modules/
+.pnpm-store/
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Logs and local scratch
+*.log
+*.tmp
+.cache/
