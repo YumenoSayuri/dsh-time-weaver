@@ -535,6 +535,45 @@ window.__ModuleLoader__.load({
     }
 
     // ------------------------------------------------ User Bubble View --
+    // DSH 0.2.1 renders user text, reference chips, and attachments through the
+    // `conversation.chat.user.content` Factory; `UiPrimitives.projectUserText`
+    // and the `renderMessageImages` prop are gone. When the host hands us the
+    // Factory seat we delegate the whole content body to it, and otherwise fall
+    // back to a literal-text bubble.
+    function userFactoryInput(props, data) {
+      var content = Array.isArray(data.content) ? data.content : []
+      var text = ''
+      var attachments = []
+      var extraBlocks = []
+      content.forEach(function (block) {
+        if (!block || typeof block !== 'object') {
+          extraBlocks.push(block)
+          return
+        }
+        if (block.type === 'text' && typeof block.text === 'string') {
+          text += block.text
+          return
+        }
+        if (block.type === 'image' && block.attachment !== undefined) {
+          attachments.push({ type: 'image', image: { attachment: block.attachment } })
+          return
+        }
+        if (block.type === 'file' && block.attachment !== undefined) {
+          attachments.push({ type: 'file', file: block.attachment })
+          return
+        }
+        extraBlocks.push(block)
+      })
+      var prepared = { text: text, attachments: attachments, extraBlocks: extraBlocks }
+      var facts = {}
+      if (data.referenceLabels !== undefined) {
+        prepared.referenceLabels = data.referenceLabels
+        facts.sessionLabels = data.referenceLabels
+      }
+      if (data.skillNames !== undefined) facts.skillNames = data.skillNames
+      return { content: prepared, loadImage: props.loadImage, facts: facts, interactive: true }
+    }
+
     function UserNodeView(props) {
       var node = props.node
       var data = node && node.data ? node.data : { content: [] }
@@ -615,20 +654,33 @@ window.__ModuleLoader__.load({
       }
 
       var stackChildren = []
-      if (parts.images.length > 0) {
-        var renderImages = props.renderMessageImages
-        if (typeof renderImages === 'function') {
-          stackChildren.push(React.createElement('div', { key: 'images', className: 'tw-images' },
-            renderImages({ images: parts.images, align: 'end', compact: parts.images.length > 1 })))
+      var factoryContent = null
+      if (typeof props.renderFactorySlot === 'function') {
+        try {
+          factoryContent = props.renderFactorySlot(
+            'conversation.chat.user.content', userFactoryInput(props, data))
+        } catch (e) {
+          factoryContent = null
         }
       }
-      if (parts.text !== '' || parts.rest.length > 0) {
-        var bubbleChildren = []
-        if (parts.text !== '') {
-          bubbleChildren.push(React.createElement('div', { key: 'text', className: 'tw-text' },
-            UiPrimitives.projectUserText(parts.text, [])))
+      if (factoryContent !== null && factoryContent !== undefined) {
+        stackChildren.push(React.createElement('div', { key: 'content', className: 'tw-factory' }, factoryContent))
+      } else {
+        if (parts.images.length > 0) {
+          var renderImages = props.renderMessageImages
+          if (typeof renderImages === 'function') {
+            stackChildren.push(React.createElement('div', { key: 'images', className: 'tw-images' },
+              renderImages({ images: parts.images, align: 'end', compact: parts.images.length > 1 })))
+          }
         }
-        stackChildren.push(React.createElement('div', { key: 'bubble', className: 'tw-bubble' }, bubbleChildren))
+        if (parts.text !== '' || parts.rest.length > 0) {
+          var bubbleChildren = []
+          if (parts.text !== '') {
+            // .tw-text declares white-space: pre-wrap, so line breaks survive.
+            bubbleChildren.push(React.createElement('div', { key: 'text', className: 'tw-text' }, parts.text))
+          }
+          stackChildren.push(React.createElement('div', { key: 'bubble', className: 'tw-bubble' }, bubbleChildren))
+        }
       }
 
       var actionsChildren = []
@@ -977,6 +1029,7 @@ window.__ModuleLoader__.load({
       '.tw-bubble{background:var(--dsw-specific-bubble,rgba(127,127,127,.14));color:var(--dsw-alias-label-primary,inherit);border-radius:22px;padding:10px 16px;font-size:16px;line-height:24px;max-width:100%;box-sizing:border-box;overflow-wrap:anywhere}',
       '.tw-images{display:flex;justify-content:flex-end;max-width:100%}',
       '.tw-text{white-space:pre-wrap;word-break:break-word}',
+      '.tw-factory{display:block;min-width:0;max-width:100%}',
       '.tw-actions{display:flex;align-items:center;gap:2px;height:28px}',
       '.tw-clock{color:var(--dsw-alias-label-tertiary,#98a2b3);white-space:nowrap;padding-right:10px;font-size:14px;line-height:24px;font-variant-numeric:tabular-nums}',
       '.tw-action{width:28px;height:28px;color:var(--dsw-alias-label-tertiary,#98a2b3);cursor:pointer;background:transparent;border:none;border-radius:14px;display:inline-flex;align-items:center;justify-content:center;padding:6px}',

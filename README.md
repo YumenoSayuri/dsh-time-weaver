@@ -38,6 +38,7 @@
 ## 环境要求
 
 - DSH Next（插件依赖宿主侧的 `webServer` / `sessions` / `agents` 服务与客户端 `slots` 服务）
+- DSH 0.2.1-rc.2 起用户气泡正文改由 `conversation.chat.user.content` Factory 渲染；插件优先使用它，缺失时自动回退纯文本
 - Node.js >= 20
 - 无运行时第三方依赖
 
@@ -150,6 +151,11 @@ dsh-time-weaver/
 ---
 
 ## 版本历史
+
+### 1.0.9 (2026-10-21 14:20)
+- 适配 DSH 0.2.1-rc.2：`UiPrimitives.projectUserText` 已被移除（用户文本改为 `conversation.user.text` 键位 Slot），原调用让整个 `conversation.chat.node` 条目抛错、用户消息整行消失。
+- 用户气泡改走宿主的 `conversation.chat.user.content` Factory（`renderFactorySlot`），正文、引用 chip、图片/文件卡片全部交回宿主渲染；拿不到 Factory 时回退为保留换行的纯文本气泡 + 旧 `renderMessageImages`。
+- 新增 `.tw-factory` 容器样式；复制/回退按钮与外层行结构不变。
 
 ### 1.0.8 (2026-10-21 11:16)
 - 行定位改为**回合锚优先**（`data-chat-turn`），与文本解耦；修复重新生成/删除"时灵时不灵"。

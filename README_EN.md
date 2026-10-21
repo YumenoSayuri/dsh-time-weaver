@@ -24,6 +24,7 @@ Assistant-side actions preserve the preceding tool calls and tool results, so no
 ## Requirements
 
 - DSH Next (uses the host `webServer` / `sessions` / `agents` services and the client `slots` service)
+- Since DSH 0.2.1-rc.2 the user bubble body is rendered by the `conversation.chat.user.content` Factory; the plugin prefers it and falls back to literal text when it is absent
 - Node.js >= 20
 - No runtime dependencies
 

@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-time-weaver",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "description": "时空编织者 (Time Weaver) — 全能会话流控制：用户消息回溯重填、AI 回复原地编辑、语义占位撤回删除、保全工具链的时空回退重新生成。",
   "type": "module",
   "main": "host.v8.js",
