@@ -71,8 +71,9 @@
 
 1. **模型上下文**由 `session.deriveMessages()` 决定。Host 在它外面包了一层投影：被编辑的回复换成新正文，被撤回的换成占位符，被回溯的区间与被重新生成的回复直接剔除。返回的 `content` 始终是标准 block 数组。
 2. **屏幕显示**不由事件驱动，而是插件按状态二次处理已渲染的行：
-   - 定位采用三级锚：`data-chat-turn` 回合号（稳定、与文本无关）→ 本轮盖的 `data-tw-seq` 章 → 全文唯一匹配。
-   - 隐藏 = 整行 `display:none`；编辑 = 就地把文本节点换掉，含换行时加 `white-space: pre-wrap`。
+   - 定位采用回合锚：先按 `data-chat-turn` 收齐本回合所有行，编辑时优先选带 `data-turn-process-answer` 的答案行，其次 `assistant-step`，绝不落到「已完成，用时 N 秒」的 `turn-process` 控制行。
+   - 编辑写入答案行里最大的 `MarkdownText` 块（`div[class*="markdown"]`）；推理块（`data-markdown-variant="compact"`）不参与，避免改到思维链。
+   - 隐藏 = 整行 `display:none`；编辑在答案 Markdown 块内挂专用编辑层并隐藏原渲染节点，不删除 React 管理的元素，含换行时加 `white-space: pre-wrap`。
    - 用 `MutationObserver`（含 `characterData`）加 1.2s 兜底重放，抵抗 React 重渲染回滚。
 3. **回溯提交**发生在下一回合的 `agent/pre-step`：把待定区间固化为隐藏区间。区间右端取**标记时刻的尾部**，因此新发的消息与它的回复不会被误伤；客户端在存在待定状态时轮询 `/state`，确保宿主提交后立即同步。
 4. **重新生成**调用 agent 实例的 `followup()` 主动开启新一轮（无需用户输入），触发消息带 `source.form = "notice"`，渲染成一行折叠提示而非用户气泡。
@@ -151,6 +152,19 @@ dsh-time-weaver/
 ---
 
 ## 版本历史
+
+### 1.0.11 (2026-10-28 22:29)
+- 修复用户消息气泡被压成一字一行的问题：插件在 `.tw-stack`（宽度由内容收缩）里再套 `.tw-factory`，宿主用户气泡自身的 `max-width:82%` 在不定宽父级里退化成极窄，中文短句（如“继续”）被逐字换行。
+- `.tw-stack` 改为 `width:100%; max-width:min(525px,82%)`，`.tw-factory` 改为 `display:flex; flex-direction:column; align-items:flex-end; width:100%`：既给宿主 `userStack` 的百分比宽度一个确定的包含块，又让 82% 宽的 `userStack` 右对齐，气泡右边缘与时间/复制/回退按钮右边缘齐平。
+- 实测短消息气泡右边缘从落后 actions 约 94.5px 修正为完全对齐（仅 1px 舍入），长消息仍受 525px / 82% 上限约束。
+
+### 1.0.10 (2026-10-28 20:44)
+- 修复新版 DSH 下「编辑 AI 输出」保存后屏幕不更新的问题：新版把已完成回合折叠成 `turn-process` 控制行（「已完成，用时 N 秒」），旧逻辑按回合取最后一行会选中控制行，整段原文匹配必然落空。
+- 编辑行选择改为按优先级评分：`data-turn-process-answer` 答案行 → `assistant-step` → 最后才考虑控制行；并排除 `group-part="reasoning"`。
+- 编辑写入改为定位答案行里的 `MarkdownText` 块（`div[class*="markdown"]`），不再依赖原文精确匹配——模型侧原文是 Markdown，渲染后 `**`、表格竖线等符号会消失；推理块（`data-markdown-variant="compact"`）明确排除。
+- 文本回写改为在答案 Markdown 块内挂专用编辑层、隐藏原渲染节点，不删除 React 子节点，避免 `removeChild` 异常，也不会把表格/代码块改成残缺结构；多段回复的新正文写入第一个文本块，其余旧片段隐藏。
+- `/edit` 与 `/message` 返回宿主侧解析的 `turn`；`turnOfSeq` 在事件缺 `data.turn` 时向前回溯最近一个带回合号的事件，编辑按钮被 portal 到外层时也不会丢回合锚。
+- host 侧取文兼容 `kind: "text"` 的文本块，冷加载后仍能拿到原文与回合锚。
 
 ### 1.0.9 (2026-10-21 14:20)
 - 适配 DSH 0.2.1-rc.2：`UiPrimitives.projectUserText` 已被移除（用户文本改为 `conversation.user.text` 键位 Slot），原调用让整个 `conversation.chat.node` 条目抛错、用户消息整行消失。

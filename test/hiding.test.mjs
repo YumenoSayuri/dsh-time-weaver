@@ -31,11 +31,53 @@ function makeEl(attrs) {
     _text: attrs.__text ?? '',
     children: [],
     nodeType: 1,
+    tagName: attrs.__tag ?? 'DIV',
     style: {},
+    parentElement: null,
+    get className() {
+      return m.get('class') ?? ''
+    },
+    get childNodes() {
+      return el.children
+    },
     getAttribute: (k) => (m.has(k) ? m.get(k) : null),
     setAttribute: (k, v) => m.set(k, String(v)),
     removeAttribute: (k) => m.delete(k),
     hasAttribute: (k) => m.has(k),
+    appendChild(child) {
+      child.parentElement = el
+      el.children.push(child)
+      return child
+    },
+    closest(sel) {
+      let cur = el
+      while (cur) {
+        if (sel === '[data-turn-process-inline]' && cur.hasAttribute('data-turn-process-inline')) return cur
+        if (sel === '[data-chat-flow-key]' && cur.hasAttribute('data-chat-flow-key')) return cur
+        cur = cur.parentElement
+      }
+      return null
+    },
+    querySelector() {
+      return null
+    },
+    querySelectorAll(sel) {
+      const out = []
+      const walk = (node) => {
+        for (const kid of node.children) {
+          if (sel === 'div[class*="markdown"]') {
+            if (kid.tagName === 'DIV' && kid.className.includes('markdown') && !kid.closest('[data-turn-process-inline]')) out.push(kid)
+          } else if (sel === '[data-turn-process-inline]') {
+            if (kid.hasAttribute('data-turn-process-inline')) out.push(kid)
+          } else if (sel === '[data-tw-collapsed]') {
+            if (kid.hasAttribute('data-tw-collapsed')) out.push(kid)
+          }
+          walk(kid)
+        }
+      }
+      walk(el)
+      return out
+    },
   }
   Object.defineProperty(el, 'textContent', {
     get() {
@@ -54,8 +96,18 @@ function makeEl(attrs) {
 function replyRow(attrs, text) {
   const row = makeEl({ 'data-chat-flow-key': attrs.__key ?? 'a', ...attrs })
   const body = makeEl({ __text: text })
-  row.children.push(body)
+  row.appendChild(body)
   row._body = body
+  return row
+}
+
+// A DSH 0.2.1 answer row: MarkdownText blocks inside the flow row.
+function markdownRow(attrs, paragraphs) {
+  const row = makeEl({ 'data-chat-flow-key': attrs.__key ?? 'm', ...attrs })
+  const md = makeEl({ class: '_x_markdown' })
+  for (const text of paragraphs) md.appendChild(makeEl({ __tag: 'P', __text: text }))
+  row.appendChild(md)
+  row._md = md
   return row
 }
 
@@ -67,6 +119,7 @@ const TOOL = (key) => makeEl({ 'data-chat-flow-key': key, 'data-chat-flow-kind':
 
 let flow = []
 const doc = {
+  createElement: (tag) => makeEl({ __tag: String(tag).toUpperCase() }),
   querySelectorAll: (sel) => {
     if (sel === '[data-chat-flow-key]') return flow.filter((r) => r.hasAttribute('data-chat-flow-key'))
     if (sel === '[data-xsj-seq]') return flow.filter((r) => r.hasAttribute('data-xsj-seq'))
@@ -182,6 +235,46 @@ setState('s', { edits: new Map([[21, 'rewritten folded answer']]), sourceTexts: 
 D.twApplyTexts('s')
 check('grouped reply is still rewritten', flow[1].textContent, 'rewritten folded answer')
 
+console.log('\nDSH 0.2.1 folded turn: the controller row must not swallow the edit')
+flow = [
+  USER(0, 'u0'),
+  replyRow({ 'data-chat-flow-kind': 'turn-process', 'data-chat-turn': '6', __key: 'c6' }, '已完成已完成，用时 25秒'),
+  markdownRow({ 'data-chat-flow-kind': 'assistant-step', 'data-chat-turn': '6', 'data-turn-process-answer': '', __key: 'a6' }, ['第一段内容', '第二段内容']),
+]
+setState('s', {
+  edits: new Map([[31, '改好的第一段\n\n改好的第二段']]),
+  sourceTexts: new Map([[31, '第一段内容\n\n**第二段内容**']]),
+  turnBySeq: new Map([[31, 6]]),
+})
+D.twApplyTexts('s')
+check('controller header untouched', flow[1].textContent, '已完成已完成，用时 25秒')
+const layer6 = flow[2]._md.children.find((c) => c.getAttribute('data-tw-edit-body') === '1')
+check('answer block rewritten despite raw markdown', layer6 ? layer6.textContent : null, '改好的第一段\n\n改好的第二段')
+check('original paragraphs hidden', flow[2]._md.children[0].style.display, 'none')
+check('newlines survive as pre-wrap', layer6 ? layer6.style.whiteSpace : null, 'pre-wrap')
+
+console.log('\ncontroller row after the answer row')
+flow = [
+  USER(0, 'u0'),
+  markdownRow({ 'data-chat-flow-kind': 'assistant-step', 'data-chat-turn': '7', 'data-turn-process-answer': '', __key: 'a7' }, ['旧答案']),
+  replyRow({ 'data-chat-flow-kind': 'turn-process', 'data-chat-turn': '7', __key: 'c7' }, '已完成已完成，用时 8秒'),
+]
+setState('s', { edits: new Map([[32, '新答案']]), sourceTexts: new Map([[32, '旧答案']]), turnBySeq: new Map([[32, 7]]) })
+D.twApplyTexts('s')
+const layer7 = flow[1]._md.children.find((c) => c.getAttribute('data-tw-edit-body') === '1')
+check('answer row still wins', layer7 ? layer7.textContent : null, '新答案')
+check('controller stays intact', flow[2].textContent, '已完成已完成，用时 8秒')
+
+console.log('\nexpanded answer row without the compact-answer marker')
+flow = [
+  USER(0, 'u0'),
+  markdownRow({ 'data-chat-flow-kind': 'assistant-step', 'data-chat-turn': '8', __key: 'a8' }, ['展开态旧答案']),
+]
+setState('s', { edits: new Map([[33, '展开态新答案']]), sourceTexts: new Map([[33, '展开态旧答案']]), turnBySeq: new Map([[33, 8]]) })
+D.twApplyTexts('s')
+const layer8 = flow[1]._md.children.find((c) => c.getAttribute('data-tw-edit-body') === '1')
+check('assistant-step answer is rewritten', layer8 ? layer8.textContent : null, '展开态新答案')
+
 console.log('\nretracted reply leaves the transcript')
 flow = [USER(0, 'u0'), replyRow({ 'data-chat-flow-kind': 'assistant-step', 'data-chat-turn': '1', __key: 'r1' }, 'long reply text')]
 setState('s', { retractions: new Map([[1, '.']]), edits: new Map(), sourceTexts: new Map([[1, 'long reply text']]) })
@@ -219,6 +312,11 @@ check('no text was rewritten', flow[1].textContent, 'rendered answer with extras
 console.log('\nrepeated passes stay stable (no flicker)')
 D.rwApply('s'); D.rwApply('s')
 check('still hidden on later passes', shown(), '.H')
+
+console.log('\nuser bubble width guards')
+check('stack has a definite width', String(/\.tw-stack\{[^}]*width:100%/.test(src)), 'true')
+check('factory has a definite width', String(/\.tw-factory\{[^}]*width:100%/.test(src)), 'true')
+check('factory right-aligns the host stack', String(/\.tw-factory\{[^}]*align-items:flex-end/.test(src)), 'true')
 
 console.log(failed === 0 ? '\nall checks passed' : `\n${failed} check(s) FAILED`)
 process.exit(failed === 0 ? 0 : 1)

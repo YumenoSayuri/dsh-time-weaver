@@ -111,8 +111,17 @@ function resolveSeq(session, body) {
 }
 
 function turnOfSeq(session, seq) {
-  const turn = eventAt(session, seq)?.data?.turn
-  return typeof turn === 'number' ? turn : undefined
+  const direct = eventAt(session, seq)?.data?.turn
+  if (typeof direct === 'number') return direct
+  // Some assistant events omit data.turn; the nearest preceding event that
+  // carries one still identifies the turn unambiguously.
+  const events = eventsOf(session) ?? []
+  const start = Math.min(seq, events.length - 1)
+  for (let i = start; i >= 0; i--) {
+    const turn = events[i]?.data?.turn
+    if (typeof turn === 'number') return turn
+  }
+  return undefined
 }
 
 function assistantTextFromEvent(event) {
@@ -120,14 +129,20 @@ function assistantTextFromEvent(event) {
   if (!data) return ''
   if (typeof data.content === 'string') return data.content
   if (Array.isArray(data.content)) {
-    return data.content.filter((c) => c && c.type === 'text').map((c) => c.text).join('')
+    return data.content
+      .filter((c) => c && (c.type === 'text' || c.kind === 'text') && typeof c.text === 'string')
+      .map((c) => c.text)
+      .join('')
   }
   if (Array.isArray(data.blocks)) {
     return data.blocks.filter((b) => b && typeof b.text === 'string').map((b) => b.text).join('')
   }
   if (typeof data.message?.content === 'string') return data.message.content
   if (Array.isArray(data.message?.content)) {
-    return data.message.content.filter((c) => c && c.type === 'text').map((c) => c.text).join('')
+    return data.message.content
+      .filter((c) => c && (c.type === 'text' || c.kind === 'text') && typeof c.text === 'string')
+      .map((c) => c.text)
+      .join('')
   }
   return ''
 }
@@ -402,7 +417,7 @@ export function apply(ctx) {
     session.append('hook/invoked', { source: SOURCE, phase: 'edit', seq, content })
     st.scannedSeq = session.seq
     st.rev += 1
-    writeJson(res, 200, { ok: true, seq, content })
+    writeJson(res, 200, { ok: true, seq, content, turn: turnOfSeq(session, seq) })
   }
 
   async function onRetract(req, res) {
@@ -498,6 +513,7 @@ export function apply(ctx) {
       ok: true,
       seq: targetSeq,
       text,
+      turn: turnOfSeq(session, targetSeq),
       isRetracted: st.retractions.has(targetSeq),
       isEdited: st.edits.has(targetSeq),
     })

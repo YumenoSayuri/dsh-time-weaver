@@ -1,4 +1,4 @@
-// @local/dsh-time-weaver — client half (Time Weaver 1.0.8)
+// @local/dsh-time-weaver — client half (Time Weaver 1.0.11)
 //
 // NOTE: this file is the live client entry (package.json exports["./client"]).
 //
@@ -353,13 +353,102 @@ window.__ModuleLoader__.load({
     // with text edits — text matching made hiding flaky and made hidden rows
     // flicker back whenever a lookup missed.
     function twReplyRowForTurn(turn) {
-      if (turn === undefined || turn === null || turn === '') return null
-      var rows = twReplyRows()
+      var rows = twRowsForTurn(turn)
       var found = null
-      for (var i = 0; i < rows.length; i++) {
-        if (rows[i].getAttribute('data-chat-turn') === String(turn)) found = rows[i]
-      }
+      for (var i = 0; i < rows.length; i++) found = rows[i]
       return found
+    }
+
+    function twRowsForTurn(turn) {
+      if (turn === undefined || turn === null || turn === '') return []
+      var rows = twReplyRows()
+      var out = []
+      for (var i = 0; i < rows.length; i++) {
+        if (rows[i].getAttribute('data-chat-turn') === String(turn)) out.push(rows[i])
+      }
+      return out
+    }
+
+    // DSH 0.2.1 renders each assistant text block through MarkdownText, whose
+    // outer div carries a `markdown` CSS-module class. The answer is the
+    // longest such block in the row; reasoning lives in its own collapsible
+    // wrapper and must never be rewritten.
+    function twMarkdownBlocks(row) {
+      if (!row || typeof row.querySelectorAll !== 'function') return []
+      var all = row.querySelectorAll('div[class*="markdown"]')
+      var out = []
+      for (var i = 0; i < all.length; i++) {
+        var el = all[i]
+        if (el.closest && el.closest('[data-turn-process-inline]')) continue
+        // Reasoning renders through the same MarkdownText with the compact
+        // variant; it is context chrome, never the answer being edited.
+        if (el.getAttribute && el.getAttribute('data-markdown-variant') === 'compact') continue
+        if (twNorm(el.textContent) === '') continue
+        out.push(el)
+      }
+      return out
+    }
+
+    function twAnswerBodies(row) {
+      var blocks = twMarkdownBlocks(row)
+      if (blocks.length > 0) return blocks
+      // Structural fallback for hosts that rename the markdown class: follow
+      // the single dominant text branch down from the row.
+      var cur = row
+      for (var depth = 0; depth < 12; depth++) {
+        var kids = cur.children || []
+        var parentLen = twNorm(cur.textContent).length
+        if (parentLen === 0) return []
+        var next = null
+        var nextLen = 0
+        for (var j = 0; j < kids.length; j++) {
+          var len2 = twNorm(kids[j].textContent).length
+          if (len2 >= parentLen * 0.85 && len2 > nextLen) { next = kids[j]; nextLen = len2 }
+        }
+        if (next === null) break
+        cur = next
+      }
+      return cur === row ? [] : [cur]
+    }
+
+    // Rank rows of a turn for editing. A folded turn has a turn-process
+    // controller row ("已完成，用时 N 秒") plus the real answer row; the
+    // controller must never be picked, or the edit silently targets chrome.
+    function twEditScore(row) {
+      var kind = row.getAttribute('data-chat-flow-kind')
+      var part = row.getAttribute('data-chat-group-part')
+      var score = 0
+      if (row.hasAttribute('data-turn-process-answer')) score += 1000
+      if (kind === 'assistant-step') score += 500
+      if (part === 'response') score += 200
+      if (part === 'reasoning') score -= 800
+      if (twMarkdownBlocks(row).length > 0) score += 100
+      if (kind === 'turn-process') score += 10
+      score += Math.min(twNorm(row.textContent).length, 400)
+      return score
+    }
+
+    function twEditRowForSeq(seq, needle, turn) {
+      var rows = twRowsForTurn(turn)
+      var best = null
+      var bestScore = -1
+      for (var i = 0; i < rows.length; i++) {
+        var score = twEditScore(rows[i])
+        if (needle !== '' && twLeafFor(rows[i], needle) !== null) score += 50
+        if (score > bestScore) { best = rows[i]; bestScore = score }
+      }
+      if (best !== null) return best
+      // Cold/legacy state without a turn: stamped row, then unique text.
+      var all = twReplyRows()
+      for (var j = 0; j < all.length; j++) {
+        if (all[j].getAttribute('data-tw-seq') === String(seq)) return all[j]
+      }
+      if (needle === '') return null
+      var matches = []
+      for (var k = 0; k < all.length; k++) {
+        if (twLeafFor(all[k], needle) !== null) matches.push(all[k])
+      }
+      return matches.length === 1 ? matches[0] : null
     }
 
     function twRowForSeq(seq, needle, turn) {
@@ -381,6 +470,71 @@ window.__ModuleLoader__.load({
       return matches.length === 1 ? matches[0] : null
     }
 
+    // Replace a rendered block's visible text without deleting React-managed
+    // element nodes. Removing children wholesale makes React's next commit
+    // call removeChild on nodes it no longer owns. A dedicated edit layer keeps
+    // the original rendering mounted-but-hidden, so tables and code blocks do
+    // not survive as half-rewritten fragments.
+    function twReplaceBlockText(root, next) {
+      if (root === null) return false
+      if (String(root.tagName || '').toUpperCase() !== 'DIV') {
+        if (root.textContent === next) return false
+        root.textContent = next
+        if (/\n/.test(next)) { try { root.style.whiteSpace = 'pre-wrap' } catch (e) {} }
+        return true
+      }
+      var kids = root.children || []
+      var layer = null
+      for (var i = 0; i < kids.length; i++) {
+        if (kids[i].getAttribute && kids[i].getAttribute('data-tw-edit-body') === '1') { layer = kids[i]; break }
+      }
+      if (layer === null) {
+        try { layer = document.createElement('div') } catch (e) { layer = null }
+        if (layer === null) {
+          if (root.textContent === next) return false
+          root.textContent = next
+          return true
+        }
+        layer.setAttribute('data-tw-edit-body', '1')
+        try { root.appendChild(layer) } catch (e) {}
+      }
+      if (layer.textContent === next) return false
+      try { root.style.display = '' } catch (e) {}
+      layer.textContent = next
+      try { layer.style.whiteSpace = 'pre-wrap' } catch (e) {}
+      if (/\n/.test(next)) { try { root.style.whiteSpace = 'pre-wrap' } catch (e) {} }
+      var nodes = root.childNodes || []
+      for (var j = 0; j < nodes.length; j++) {
+        var node = nodes[j]
+        if (node === layer) continue
+        if (node.nodeType === 3) { node.nodeValue = ''; continue }
+        if (node.nodeType !== 1) continue
+        try { node.style.display = 'none' } catch (e) {}
+        node.setAttribute('data-tw-collapsed', '1')
+      }
+      if (next === '') { try { root.style.display = 'none' } catch (e) {} }
+      return true
+    }
+
+    function twApplyEditToRow(row, needle, next) {
+      if (row === null) return false
+      // The stored original is raw Markdown; the DOM renders it (bold markers,
+      // table pipes and heading hashes disappear), so an exact text match is
+      // not guaranteed. The answer block is still addressable by structure.
+      var kind = row.getAttribute('data-chat-flow-kind')
+      if (kind !== 'assistant-step' && !row.hasAttribute('data-turn-process-answer')) return false
+      var bodies = twAnswerBodies(row)
+      if (bodies.length === 0) return false
+      var changed = twReplaceBlockText(bodies[0], next)
+      // A reply can interleave text around tool cards. The edited body belongs
+      // in the first text block; the remaining fragments must not survive as
+      // stale duplicates of the old answer.
+      for (var b = 1; b < bodies.length; b++) {
+        if (twReplaceBlockText(bodies[b], '')) changed = true
+      }
+      return changed
+    }
+
     // Rewrite rendered reply text for edited seqs and stamp the rows of
     // retracted seqs (which are hidden, not rewritten). A row that cannot be
     // identified with certainty is left untouched rather than guessed.
@@ -396,17 +550,10 @@ window.__ModuleLoader__.load({
       var applyOne = function (seq, next) {
         if (typeof next !== 'string') return
         var needle = twNorm(sources.get(seq))
-        var row = twRowForSeq(seq, needle, turns.get(seq))
+        var row = twEditRowForSeq(seq, needle, turns.get(seq))
         if (row === null) return
         row.setAttribute('data-tw-seq', String(seq))
-        var leaf = twLeafFor(row, needle)
-        if (leaf === null) return
-        if (twNorm(leaf.textContent) === twNorm(next)) return
-        leaf.textContent = next
-        // The transcript is HTML: without pre-wrap the edited line breaks
-        // collapse into one run-on paragraph.
-        if (/\n/.test(next)) { try { leaf.style.whiteSpace = 'pre-wrap' } catch (e) {} }
-        applied += 1
+        if (twApplyEditToRow(row, needle, next)) applied += 1
       }
 
       // Retractions and regenerations only need the anchor: those rows are
@@ -455,6 +602,7 @@ window.__ModuleLoader__.load({
           stepRows: document.querySelectorAll('[data-chat-flow-kind="assistant-step"]').length,
           processRows: document.querySelectorAll('[data-chat-flow-kind="turn-process"]').length,
           answerMarkers: document.querySelectorAll('[data-turn-process-answer]').length,
+          markdownBlocks: document.querySelectorAll('div[class*="markdown"]').length,
           flowRows: document.querySelectorAll('[data-chat-flow-key]').length,
           edits: edits,
           retractions: retractions,
@@ -751,7 +899,7 @@ window.__ModuleLoader__.load({
                 messageId: messageId,
                 seq: res.seq,
                 text: res.text || '',
-                turn: turn,
+                turn: turn !== null && turn !== undefined && turn !== '' ? turn : (typeof res.turn === 'number' ? res.turn : null),
               }
               emit()
             }
@@ -869,8 +1017,18 @@ window.__ModuleLoader__.load({
               sources.set(seq, props.initialText)
             }
             var turns = new Map(st.turnBySeq || new Map())
-            if (props.turn !== null && props.turn !== undefined && props.turn !== '') turns.set(seq, Number(props.turn))
+            var resolvedTurn = props.turn
+            if ((resolvedTurn === null || resolvedTurn === undefined || resolvedTurn === '') && typeof res.turn === 'number') {
+              resolvedTurn = res.turn
+            }
+            if (resolvedTurn !== null && resolvedTurn !== undefined && resolvedTurn !== '') turns.set(seq, Number(resolvedTurn))
             writeState(sid, { edits: edits, retractions: rets, sourceTexts: sources, turnBySeq: turns })
+            try { rwApply(sid) } catch (e) {}
+            // A portaled action strip may not expose data-chat-turn. Re-read
+            // /state, where the host resolves the turn from the event itself.
+            if (resolvedTurn === null || resolvedTurn === undefined || resolvedTurn === '') {
+              rwLoadState(sid).then(() => { try { rwApply(sid) } catch (e) {} })
+            }
             props.onClose()
           }
         }).catch(() => {}).then(() => setSubmitting(false))
@@ -1025,11 +1183,11 @@ window.__ModuleLoader__.load({
 
     var TW_CSS = [
       '.tw-row{display:flex;flex-direction:column;align-items:flex-end;gap:6px;min-width:0}',
-      '.tw-stack{display:flex;flex-direction:column;align-items:flex-end;gap:8px;min-width:0;max-width:min(525px,82%)}',
+      '.tw-stack{display:flex;flex-direction:column;align-items:flex-end;gap:8px;min-width:0;width:100%;max-width:min(525px,82%)}',
       '.tw-bubble{background:var(--dsw-specific-bubble,rgba(127,127,127,.14));color:var(--dsw-alias-label-primary,inherit);border-radius:22px;padding:10px 16px;font-size:16px;line-height:24px;max-width:100%;box-sizing:border-box;overflow-wrap:anywhere}',
       '.tw-images{display:flex;justify-content:flex-end;max-width:100%}',
       '.tw-text{white-space:pre-wrap;word-break:break-word}',
-      '.tw-factory{display:block;min-width:0;max-width:100%}',
+      '.tw-factory{display:flex;flex-direction:column;align-items:flex-end;width:100%;min-width:0;max-width:100%}',
       '.tw-actions{display:flex;align-items:center;gap:2px;height:28px}',
       '.tw-clock{color:var(--dsw-alias-label-tertiary,#98a2b3);white-space:nowrap;padding-right:10px;font-size:14px;line-height:24px;font-variant-numeric:tabular-nums}',
       '.tw-action{width:28px;height:28px;color:var(--dsw-alias-label-tertiary,#98a2b3);cursor:pointer;background:transparent;border:none;border-radius:14px;display:inline-flex;align-items:center;justify-content:center;padding:6px}',
@@ -1072,7 +1230,7 @@ window.__ModuleLoader__.load({
       try {
         post('/diag', {
           v: 'boot',
-          ver: '1.0.8',
+          ver: '1.0.11',
           hasSlots: !!(slots && typeof slots.inject === 'function' && typeof slots.register === 'function'),
         })
       } catch (e) {}
