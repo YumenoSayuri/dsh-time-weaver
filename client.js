@@ -1,4 +1,4 @@
-// @local/dsh-time-weaver — client half (Time Weaver 1.0.11)
+// @local/dsh-time-weaver — client half (Time Weaver 1.0.12)
 //
 // NOTE: this file is the live client entry (package.json exports["./client"]).
 //
@@ -16,6 +16,32 @@ window.__ModuleLoader__.load({
     var exports = module.exports
     var React = require('react')
     var UiPrimitives = require('@deepseek-ai/dsh-client-ui-primitives')
+    var ReactDOMClient = null
+    try {
+      if (typeof require === 'function') ReactDOMClient = require('react-dom/client')
+    } catch (e) {
+      ReactDOMClient = null
+    }
+
+    // Labels the host MarkdownText needs for code-block chrome. The assistant
+    // body renderer passes the full locale table; the plugin only needs these
+    // stable keys, so a compact literal keeps the edit layer independent of
+    // the chat package's private locale helpers.
+    var TW_MD_LABELS = {
+      code: {
+        copyLabel: '复制',
+        copiedLabel: '已复制',
+        toolbarLabels: {
+          codeLabel: '代码',
+          wrapLabel: '自动换行',
+          unwrapLabel: '取消换行',
+        },
+      },
+      footnotes: '脚注',
+    }
+    // Bumped whenever the edit-layer renderer changes, so an HMR update
+    // re-renders layers left behind by the previous module instance.
+    var TW_EDIT_VERSION = '1.0.12'
 
     var API = '/api/time-weaver'
 
@@ -379,6 +405,10 @@ window.__ModuleLoader__.load({
       var out = []
       for (var i = 0; i < all.length; i++) {
         var el = all[i]
+        // Our edit layer contains its own MarkdownText render, which also
+        // carries a `markdown` class. Never treat that nested render as an
+        // answer block, or the next pass rewrites the layer inside itself.
+        if (el.closest && el.closest('[data-tw-edit-body]')) continue
         if (el.closest && el.closest('[data-turn-process-inline]')) continue
         // Reasoning renders through the same MarkdownText with the compact
         // variant; it is context chrome, never the answer being edited.
@@ -475,6 +505,85 @@ window.__ModuleLoader__.load({
     // call removeChild on nodes it no longer owns. A dedicated edit layer keeps
     // the original rendering mounted-but-hidden, so tables and code blocks do
     // not survive as half-rewritten fragments.
+    // Render edited Markdown through the host's own MarkdownText so headings,
+    // lists, tables, code blocks and links keep their normal appearance. The
+    // layer is its own React root; when react-dom is unavailable (older host
+    // or a stripped runtime) the caller falls back to literal text.
+    function twRenderMarkdown(layer, text) {
+      if (layer === null) return
+      if (text === '') {
+        if (layer.__twRoot) {
+          try { layer.__twRoot.render(null) } catch (e) {}
+        } else {
+          layer.textContent = ''
+        }
+        return
+      }
+      // Keep a visible plain-text fallback in the layer before the React root
+      // commits. A failed MarkdownText render must never leave the original
+      // children hidden behind an empty layer.
+      if (!layer.__twRoot) {
+        layer.textContent = text
+        layer.style.whiteSpace = 'pre-wrap'
+      }
+      if (ReactDOMClient && typeof ReactDOMClient.createRoot === 'function' && UiPrimitives && UiPrimitives.MarkdownText) {
+        try {
+          if (!layer.__twRoot) layer.__twRoot = ReactDOMClient.createRoot(layer)
+          layer.__twRoot.render(React.createElement(TwMarkdownBoundary, {
+            onError: function () { twFallbackPlain(layer, text) },
+          }, React.createElement(UiPrimitives.MarkdownText, {
+            text: text,
+            streaming: false,
+            labels: TW_MD_LABELS,
+            variant: 'body',
+          })))
+          layer.style.whiteSpace = ''
+          // Watchdog: if React committed nothing, show the literal text rather
+          // than an invisible edited message.
+          setTimeout(function () {
+            if (layer.__twText !== text) return
+            if (twNorm(layer.textContent) !== '') return
+            twFallbackPlain(layer, text)
+          }, 600)
+          return
+        } catch (e) {
+          // fall through to literal text
+        }
+      }
+      twFallbackPlain(layer, text)
+    }
+
+    function twFallbackPlain(layer, text) {
+      try {
+        if (layer.__twRoot) {
+          layer.__twRoot.unmount()
+          layer.__twRoot = null
+        }
+      } catch (e) {}
+      layer.textContent = text
+      layer.style.whiteSpace = 'pre-wrap'
+    }
+
+    // MarkdownText is the host's renderer; an unexpected block shape or a
+    // missing label must degrade to literal text instead of unmounting the
+    // edited reply.
+    function TwMarkdownBoundary(props) {
+      React.Component.call(this, props)
+      this.state = { failed: false }
+    }
+    TwMarkdownBoundary.prototype = Object.create(React.Component.prototype)
+    TwMarkdownBoundary.prototype.constructor = TwMarkdownBoundary
+    TwMarkdownBoundary.getDerivedStateFromError = function () { return { failed: true } }
+    TwMarkdownBoundary.prototype.componentDidCatch = function () {
+      if (this.props && typeof this.props.onError === 'function') {
+        var onError = this.props.onError
+        setTimeout(function () { onError() }, 0)
+      }
+    }
+    TwMarkdownBoundary.prototype.render = function () {
+      return this.state.failed ? null : this.props.children
+    }
+
     function twReplaceBlockText(root, next) {
       if (root === null) return false
       if (String(root.tagName || '').toUpperCase() !== 'DIV') {
@@ -498,11 +607,11 @@ window.__ModuleLoader__.load({
         layer.setAttribute('data-tw-edit-body', '1')
         try { root.appendChild(layer) } catch (e) {}
       }
-      if (layer.textContent === next) return false
+      if (layer.__twText === next && layer.__twVersion === TW_EDIT_VERSION) return false
       try { root.style.display = '' } catch (e) {}
-      layer.textContent = next
-      try { layer.style.whiteSpace = 'pre-wrap' } catch (e) {}
-      if (/\n/.test(next)) { try { root.style.whiteSpace = 'pre-wrap' } catch (e) {} }
+      layer.__twText = next
+      layer.__twVersion = TW_EDIT_VERSION
+      twRenderMarkdown(layer, next)
       var nodes = root.childNodes || []
       for (var j = 0; j < nodes.length; j++) {
         var node = nodes[j]
@@ -1230,7 +1339,7 @@ window.__ModuleLoader__.load({
       try {
         post('/diag', {
           v: 'boot',
-          ver: '1.0.11',
+          ver: '1.0.12',
           hasSlots: !!(slots && typeof slots.inject === 'function' && typeof slots.register === 'function'),
         })
       } catch (e) {}

@@ -134,11 +134,62 @@ const doc = {
 const states = new Map()
 const shim = { window: { dispatchEvent() {} } }
 
-const factory = new Function('document', 'store', 'window', 'post', `
+// Minimal React / MarkdownText / react-dom stubs: the edit layer renders the
+// host MarkdownText component, so the test records the element it was asked to
+// render and exposes its text on the layer.
+function Component(props) {
+  this.props = props
+  this.state = {}
+}
+Component.prototype.setState = function (patch) {
+  this.state = Object.assign({}, this.state, patch)
+}
+const ReactStub = {
+  createElement: (type, props, ...children) => ({
+    type,
+    props: Object.assign({}, props, { children: children.length === 1 ? children[0] : children }),
+  }),
+  Component,
+}
+const UiStub = { MarkdownText: function MarkdownText() {} }
+function markdownTextOf(node) {
+  if (!node) return null
+  if (node.props && typeof node.props.text === 'string') return node.props.text
+  const children = node.props && node.props.children
+  if (Array.isArray(children)) {
+    for (const child of children) {
+      const found = markdownTextOf(child)
+      if (found !== null) return found
+    }
+  } else if (children && typeof children === 'object') {
+    return markdownTextOf(children)
+  }
+  return null
+}
+function hasMarkdownNode(node) {
+  if (!node) return false
+  if (node.type === UiStub.MarkdownText) return true
+  const children = node.props && node.props.children
+  if (Array.isArray(children)) return children.some(hasMarkdownNode)
+  return children && typeof children === 'object' ? hasMarkdownNode(children) : false
+}
+const ReactDOMStub = {
+  createRoot: (el) => ({
+    render(node) {
+      el.__reactNode = node
+      const text = markdownTextOf(node)
+      el.textContent = text === null ? '' : text
+    },
+    unmount() {},
+  }),
+}
+const labelsStub = { code: { copyLabel: '', copiedLabel: '', toolbarLabels: {} }, footnotes: '' }
+
+const factory = new Function('document', 'store', 'window', 'post', 'React', 'UiPrimitives', 'ReactDOMClient', 'TW_MD_LABELS', 'TW_EDIT_VERSION', `
 ${region}
 return { rwApply, rwRestoreAll, twApplyTexts };
 `)
-const D = factory(doc, states, shim.window, () => Promise.resolve(null))
+const D = factory(doc, states, shim.window, () => Promise.resolve(null), ReactStub, UiStub, ReactDOMStub, labelsStub, 'test')
 
 // ------------------------------------------------------------------ cases --
 // Rows: u0 a1 u2 a3 t3 u4 a5 鈥?only user rows carry a seq stamp.
@@ -242,16 +293,17 @@ flow = [
   markdownRow({ 'data-chat-flow-kind': 'assistant-step', 'data-chat-turn': '6', 'data-turn-process-answer': '', __key: 'a6' }, ['第一段内容', '第二段内容']),
 ]
 setState('s', {
-  edits: new Map([[31, '改好的第一段\n\n改好的第二段']]),
+  edits: new Map([[31, '改好的第一段\n\n**改好的第二段**']]),
   sourceTexts: new Map([[31, '第一段内容\n\n**第二段内容**']]),
   turnBySeq: new Map([[31, 6]]),
 })
 D.twApplyTexts('s')
 check('controller header untouched', flow[1].textContent, '已完成已完成，用时 25秒')
 const layer6 = flow[2]._md.children.find((c) => c.getAttribute('data-tw-edit-body') === '1')
-check('answer block rewritten despite raw markdown', layer6 ? layer6.textContent : null, '改好的第一段\n\n改好的第二段')
+check('answer block rewritten despite raw markdown', layer6 ? layer6.textContent : null, '改好的第一段\n\n**改好的第二段**')
 check('original paragraphs hidden', flow[2]._md.children[0].style.display, 'none')
-check('newlines survive as pre-wrap', layer6 ? layer6.style.whiteSpace : null, 'pre-wrap')
+check('edit layer uses host MarkdownText', String(hasMarkdownNode(layer6 && layer6.__reactNode)), 'true')
+check('markdown syntax reaches MarkdownText', markdownTextOf(layer6 && layer6.__reactNode), '改好的第一段\n\n**改好的第二段**')
 
 console.log('\ncontroller row after the answer row')
 flow = [
@@ -290,7 +342,8 @@ console.log('\nedited multi-line text keeps its line breaks')
 flow = [USER(0, 'u0'), replyRow({ 'data-chat-flow-kind': 'assistant-step', 'data-chat-turn': '2', __key: 'r2' }, 'first paragraph')]
 setState('s', { edits: new Map([[2, 'first paragraph\n\nsecond paragraph']]), sourceTexts: new Map([[2, 'first paragraph']]), turnBySeq: new Map([[2, 2]]) })
 D.rwApply('s')
-check('newlines survive as pre-wrap', flow[1]._body.style.whiteSpace, 'pre-wrap')
+const layer2 = flow[1]._body.children.find((c) => c.getAttribute('data-tw-edit-body') === '1')
+check('markdown renderer receives line breaks', markdownTextOf(layer2 && layer2.__reactNode), 'first paragraph\n\nsecond paragraph')
 check('edited text applied', flow[1].textContent, 'first paragraph\n\nsecond paragraph')
 
 console.log('\nregenerated reply is hidden once located by its text')

@@ -73,7 +73,7 @@
 2. **屏幕显示**不由事件驱动，而是插件按状态二次处理已渲染的行：
    - 定位采用回合锚：先按 `data-chat-turn` 收齐本回合所有行，编辑时优先选带 `data-turn-process-answer` 的答案行，其次 `assistant-step`，绝不落到「已完成，用时 N 秒」的 `turn-process` 控制行。
    - 编辑写入答案行里最大的 `MarkdownText` 块（`div[class*="markdown"]`）；推理块（`data-markdown-variant="compact"`）不参与，避免改到思维链。
-   - 隐藏 = 整行 `display:none`；编辑在答案 Markdown 块内挂专用编辑层并隐藏原渲染节点，不删除 React 管理的元素，含换行时加 `white-space: pre-wrap`。
+   - 隐藏 = 整行 `display:none`；编辑在答案 Markdown 块内挂专用编辑层并隐藏原渲染节点，编辑层用宿主 `MarkdownText` 重新渲染 Markdown，不删除 React 管理的元素。
    - 用 `MutationObserver`（含 `characterData`）加 1.2s 兜底重放，抵抗 React 重渲染回滚。
 3. **回溯提交**发生在下一回合的 `agent/pre-step`：把待定区间固化为隐藏区间。区间右端取**标记时刻的尾部**，因此新发的消息与它的回复不会被误伤；客户端在存在待定状态时轮询 `/state`，确保宿主提交后立即同步。
 4. **重新生成**调用 agent 实例的 `followup()` 主动开启新一轮（无需用户输入），触发消息带 `source.form = "notice"`，渲染成一行折叠提示而非用户气泡。
@@ -152,6 +152,12 @@ dsh-time-weaver/
 ---
 
 ## 版本历史
+
+### 1.0.12 (2026-10-31 20:54)
+- 修复编辑后的 AI 回复变成明文代码的问题：1.0.10 的编辑层把正文当纯文本写进 `pre-wrap` 层，Markdown 语法不再渲染；现在编辑层通过平台共享的 `react-dom/client` 挂独立 React root，用宿主 `UiPrimitives.MarkdownText` 重新渲染，标题、列表、表格、代码块、链接恢复正常显示。
+- 保留“隐藏原渲染节点、不删除 React 子节点”的安全策略；`react-dom` 不可用时仍回退纯文本，不会白屏。
+- 编辑层带渲染版本标记：插件热更新后，旧版本留下的纯文本层会自动重渲染为 Markdown，不会停留在旧样式。
+- 运行时自检确认 `**粗体**` 与 `- 一/- 二` 能渲染成 `<strong>` 和 `<ul><li>`。
 
 ### 1.0.11 (2026-10-28 22:29)
 - 修复用户消息气泡被压成一字一行的问题：插件在 `.tw-stack`（宽度由内容收缩）里再套 `.tw-factory`，宿主用户气泡自身的 `max-width:82%` 在不定宽父级里退化成极窄，中文短句（如“继续”）被逐字换行。
