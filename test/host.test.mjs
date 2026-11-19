@@ -31,6 +31,9 @@ const session = {
   id: 'sess-1',
   events,
   seq: events.length,
+  // The live turn boundary. rebuild() drops a pending rewind whose mark landed
+  // before it, so the fake session needs one or every pending looks stale.
+  firstLiveSeq: 0,
   surface: { nodes: [0, 1, 2], contentGeneration: 1 },
   snapshotEvents() { return events },
   eventAt(seq) { return events[seq] },
@@ -177,6 +180,64 @@ const range = state3.payload.ranges.at(-1)
 check('committed range ends at the mark-time tail', range?.end === tailAtIndex)
 check('the fresh prompt is outside the hidden range', freshSeq > (range?.end ?? -1))
 check('committed range starts at the rewound prompt', range?.start === 1)
+
+// ------------------------------------------------- editing a user prompt --
+// A sent prompt can be corrected in place: the model must read the new words
+// from the next turn on, and any attachment must survive the rewrite.
+console.log('\nediting a user prompt')
+const userSeq = pushEvent({
+  type: 'user/message',
+  data: {
+    role: 'user',
+    id: 'u9',
+    content: [
+      { type: 'text', text: '原始提问' },
+      { type: 'image', attachment: { attachmentId: 'img-1', mediaType: 'image/png' } },
+    ],
+  },
+}).seq
+session.seq = events.length
+session.surface.nodes.push(userSeq)
+session.surface.contentGeneration = 2
+
+const rejectAsst = await call('POST', '/api/time-weaver/edit-user', { sessionId: 'sess-1', seq: 2, content: 'nope' })
+check('a reply cannot be edited through the user channel', rejectAsst.status === 400)
+
+const editUserRes = await call('POST', '/api/time-weaver/edit-user', { sessionId: 'sess-1', seq: userSeq, content: '改过的提问' })
+check('user edit accepted', editUserRes.status === 200 && editUserRes.payload.ok === true)
+check('user edit reports the pristine text', editUserRes.payload.originalText === '原始提问')
+
+const derivedUser = session.deriveMessages().find((m) => m.role === 'user' && Array.isArray(m.content) && m.content.some((c) => c.type === 'image'))
+check('the edited prompt reaches model history', derivedUser !== undefined && blockText(derivedUser.content) === '改过的提问')
+check(
+  'the attachment block survives the rewrite',
+  derivedUser !== undefined && derivedUser.content.some((c) => c.type === 'image' && c.attachment?.attachmentId === 'img-1'),
+)
+check('user content stays a block array', Array.isArray(derivedUser?.content))
+
+const stateUser = await call('GET', '/api/time-weaver/state', undefined, '?sessionId=sess-1')
+const userEntry = (stateUser.payload.userEdits ?? []).find((e) => e.seq === userSeq)
+check('/state exposes the user edit', userEntry?.content === '改过的提问' && userEntry?.originalText === '原始提问')
+
+const msgUser = await call('GET', '/api/time-weaver/message', undefined, '?sessionId=sess-1&seq=' + userSeq)
+check('/message marks the role as user', msgUser.payload.role === 'user')
+check('/message returns the edited text', msgUser.payload.text === '改过的提问')
+check('/message reports it as edited', msgUser.payload.isEdited === true)
+
+// Edit-and-re-ask: the corrected words become the next prompt while the
+// original prompt and its reply fall into a rewind range.
+console.log('\nedit and re-ask')
+const beforeFollowups = followups.length
+const resendRes = await call('POST', '/api/time-weaver/edit-user', {
+  sessionId: 'sess-1', seq: userSeq, content: '再问一次', resend: true,
+})
+check('resend accepted and restarted', resendRes.payload.ok === true && resendRes.payload.restarted === true)
+check('resend wakes the agent once', followups.length === beforeFollowups + 1)
+const reask = followups.at(-1)
+check('the re-ask carries the edited words', reask !== undefined && blockText(reask.content) === '再问一次')
+check('the re-ask is a real user message, not a notice', reask !== undefined && reask.source === undefined)
+const statePending = await call('GET', '/api/time-weaver/state', undefined, '?sessionId=sess-1')
+check('a rewind range is pending for the re-ask', statePending.payload.pending?.targetSeq === userSeq)
 
 console.log(failed === 0 ? '\nall checks passed' : `\n${failed} check(s) FAILED`)
 process.exit(failed === 0 ? 0 : 1)

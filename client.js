@@ -41,7 +41,7 @@ window.__ModuleLoader__.load({
     }
     // Bumped whenever the edit-layer renderer changes, so an HMR update
     // re-renders layers left behind by the previous module instance.
-    var TW_EDIT_VERSION = '1.0.12'
+    var TW_EDIT_VERSION = '1.0.13'
 
     var API = '/api/time-weaver'
 
@@ -61,8 +61,11 @@ window.__ModuleLoader__.load({
       copied: '已复制',
       rewind: '回退至此 (打断并重填)',
       edit: '编辑此回复',
+      editUser: '编辑此消息',
       retract: '撤回/删除此回复',
       regenerate: '重新生成 (保全工具链)',
+      resend: '保存并重新生成',
+      resending: '重发中...',
       cancel: '取消回溯',
       banner: '时间线已定格：当前尾部已被安全隐去，随时可再次调整或提交新消息。',
       image: '[图片附件]',
@@ -74,6 +77,8 @@ window.__ModuleLoader__.load({
       settings: '时空编织者设置',
       editTitle: '编辑 AI 回复内容',
       editHint: '修改后将实时更新模型上下文，后续对话将顺着修改后的内容继续推演。',
+      editUserTitle: '编辑已发送的消息',
+      editUserHint: '修改只改变模型读到的这条消息，屏幕上同步更新；上一条回答保持原样。想连回答一起重做，用「保存并重新生成」。',
     }
 
     // ------------------------------------------------ Pure SVG Icons --
@@ -221,6 +226,7 @@ window.__ModuleLoader__.load({
           pending: null,
           ranges: [],
           edits: new Map(),
+          userEdits: new Map(),
           retractions: new Map(),
           regenerates: new Set(),
           sourceTexts: new Map(),
@@ -259,6 +265,16 @@ window.__ModuleLoader__.load({
             }
           })
         }
+        var userEditsMap = new Map()
+        if (Array.isArray(res.userEdits)) {
+          res.userEdits.forEach((e) => {
+            if (typeof e.seq === 'number' && typeof e.content === 'string') {
+              userEditsMap.set(e.seq, e.content)
+              if (typeof e.originalText === 'string' && e.originalText !== '') sourceMap.set(e.seq, e.originalText)
+              if (typeof e.turn === 'number') turnMap.set(e.seq, e.turn)
+            }
+          })
+        }
         var retMap = new Map()
         if (Array.isArray(res.retractions)) {
           res.retractions.forEach((item) => {
@@ -286,6 +302,7 @@ window.__ModuleLoader__.load({
           pending: res.pending || null,
           ranges: Array.isArray(res.ranges) ? res.ranges : [],
           edits: editsMap,
+          userEdits: userEditsMap,
           retractions: retMap,
           regenerates: regSet,
           sourceTexts: sourceMap,
@@ -584,11 +601,15 @@ window.__ModuleLoader__.load({
       return this.state.failed ? null : this.props.children
     }
 
-    function twReplaceBlockText(root, next) {
+    // `plain` keeps the literal characters the user typed. An assistant reply is
+    // Markdown and must be re-rendered as such; a user prompt is plain text, so
+    // running it through MarkdownText would silently eat characters like `*`.
+    function twReplaceBlockText(root, next, plain, seqTag) {
       if (root === null) return false
       if (String(root.tagName || '').toUpperCase() !== 'DIV') {
         if (root.textContent === next) return false
         root.textContent = next
+        if (seqTag !== undefined) { try { root.setAttribute('data-tw-edit-seq', String(seqTag)) } catch (e) {} }
         if (/\n/.test(next)) { try { root.style.whiteSpace = 'pre-wrap' } catch (e) {} }
         return true
       }
@@ -605,13 +626,20 @@ window.__ModuleLoader__.load({
           return true
         }
         layer.setAttribute('data-tw-edit-body', '1')
+        if (seqTag !== undefined) { try { layer.setAttribute('data-tw-edit-seq', String(seqTag)) } catch (e) {} }
         try { root.appendChild(layer) } catch (e) {}
+      } else if (seqTag !== undefined && layer.getAttribute('data-tw-edit-seq') !== String(seqTag)) {
+        // Re-used layer: keep the tag in sync so a later pass can find it by seq
+        // instead of falling back to content matching.
+        try { layer.setAttribute('data-tw-edit-seq', String(seqTag)) } catch (e) {}
       }
-      if (layer.__twText === next && layer.__twVersion === TW_EDIT_VERSION) return false
+      var version = plain ? TW_EDIT_VERSION + '-p' : TW_EDIT_VERSION
+      if (layer.__twText === next && layer.__twVersion === version) return false
       try { root.style.display = '' } catch (e) {}
       layer.__twText = next
-      layer.__twVersion = TW_EDIT_VERSION
-      twRenderMarkdown(layer, next)
+      layer.__twVersion = version
+      if (plain) twFallbackPlain(layer, next)
+      else twRenderMarkdown(layer, next)
       var nodes = root.childNodes || []
       for (var j = 0; j < nodes.length; j++) {
         var node = nodes[j]
@@ -644,16 +672,122 @@ window.__ModuleLoader__.load({
       return changed
     }
 
-    // Rewrite rendered reply text for edited seqs and stamp the rows of
-    // retracted seqs (which are hidden, not rewritten). A row that cannot be
-    // identified with certainty is left untouched rather than guessed.
+    // A user prompt is addressed by its own stamp: UserNodeView writes
+    // `data-xsj-seq` on the host flow row, and that attribute survives
+    // re-renders.
+    function twUserRowForSeq(seq) {
+      var rows = document.querySelectorAll('[data-xsj-seq]')
+      for (var i = 0; i < rows.length; i++) {
+        if (rows[i].getAttribute('data-xsj-seq') === String(seq)) return rows[i]
+      }
+      return null
+    }
+
+    // Attribute and class lookup without querySelector: the same code has to run
+    // against the host DOM and against the test shim.
+    function twFindByAttr(root, attr, value) {
+      var walk = function (el) {
+        var kids = el.children || []
+        for (var i = 0; i < kids.length; i++) {
+          var kid = kids[i]
+          if (kid.getAttribute && kid.getAttribute(attr) === value) return kid
+          var found = walk(kid)
+          if (found !== null) return found
+        }
+        return null
+      }
+      return walk(root)
+    }
+
+    function twFindByClass(root, cls) {
+      var walk = function (el) {
+        var kids = el.children || []
+        for (var i = 0; i < kids.length; i++) {
+          var kid = kids[i]
+          var name = kid.className || (kid.getAttribute && kid.getAttribute('class')) || ''
+          if (String(name).split(/\s+/).indexOf(cls) !== -1) return kid
+          var found = walk(kid)
+          if (found !== null) return found
+        }
+        return null
+      }
+      return walk(root)
+    }
+
+    // Walk down the single dominant text branch of a bubble. The bubble chrome —
+    // background, padding, rounded corners — lives on an ancestor, so the edit
+    // layer must land inside the text container. Replacing the bubble would
+    // leave the edited prompt floating with no background.
+    function twDominantTextBranch(root) {
+      var cur = root
+      for (var depth = 0; depth < 12; depth++) {
+        var kids = cur.children || []
+        var parentLen = twNorm(cur.textContent).length
+        if (parentLen === 0) return cur
+        var next = null
+        var nextLen = 0
+        for (var i = 0; i < kids.length; i++) {
+          var len = twNorm(kids[i].textContent).length
+          if (len >= parentLen * 0.85 && len > nextLen) { next = kids[i]; nextLen = len }
+        }
+        if (next === null) return cur
+        cur = next
+      }
+      return cur
+    }
+
+    function twApplyUserEdit(seq, next, needle) {
+      var row = twUserRowForSeq(seq)
+      if (row === null) return false
+      var tag = String(seq)
+
+      // 1. This row was edited before. Its original text is gone from the DOM,
+      // so content matching can never find it again — go by the tag the edit
+      // layer carries. Without this, every replay would stack another layer and
+      // hide the bubble chrome behind it.
+      var holder = twFindByAttr(row, 'data-tw-edit-seq', tag)
+      if (holder !== null) {
+        if (holder.getAttribute('data-tw-edit-body') === '1') {
+          var version = TW_EDIT_VERSION + '-p'
+          if (holder.__twText === next && holder.__twVersion === version) return false
+          holder.__twText = next
+          holder.__twVersion = version
+          twFallbackPlain(holder, next)
+          return true
+        }
+        if (holder.textContent === next) return false
+        holder.textContent = next
+        return true
+      }
+
+      // 2. First edit: locate the text by its original content and rewrite that
+      // node only, so an attachment sharing the bubble keeps rendering.
+      if (needle !== '') {
+        var leaf = twLeafFor(row, needle)
+        if (leaf !== null) return twReplaceBlockText(leaf, next, true, tag)
+      }
+
+      // 3. The rendered text no longer matches the stored original (the host
+      // re-rendered it, or the prompt is a single character). Descend to the
+      // text container rather than replacing the whole bubble.
+      var factory = twFindByClass(row, 'tw-factory')
+      var host = factory !== null ? factory : twFindByClass(row, 'tw-bubble')
+      if (host === null) return false
+      var branch = twDominantTextBranch(host)
+      return twReplaceBlockText(branch !== null ? branch : host, next, true, tag)
+    }
+
+    // Rewrite rendered reply text for edited seqs, user prompts for edited
+    // user seqs, and stamp the rows of retracted seqs (which are hidden, not
+    // rewritten). A row that cannot be identified with certainty is left
+    // untouched rather than guessed.
     function twApplyTexts(sid) {
       var st = store.get(sid)
       if (!st) return 0
       var sources = st.sourceTexts || new Map()
       var turns = st.turnBySeq || new Map()
       var rows = twReplyRows()
-      if (rows.length === 0) return 0
+      if (rows.length === 0 && !(st.userEdits && st.userEdits.size > 0)) return 0
       var applied = 0
 
       var applyOne = function (seq, next) {
@@ -663,6 +797,13 @@ window.__ModuleLoader__.load({
         if (row === null) return
         row.setAttribute('data-tw-seq', String(seq))
         if (twApplyEditToRow(row, needle, next)) applied += 1
+      }
+
+      // A user prompt carries its own seq stamp, so no turn/answer lookup is
+      // involved: locate the stamped row, then rewrite only its text.
+      var applyUserOne = function (seq, next) {
+        if (typeof next !== 'string') return
+        if (twApplyUserEdit(seq, next, twNorm(sources.get(seq)))) applied += 1
       }
 
       // Retractions and regenerations only need the anchor: those rows are
@@ -675,6 +816,7 @@ window.__ModuleLoader__.load({
       }
 
       if (st.edits) st.edits.forEach((text, seq) => applyOne(seq, text))
+      if (st.userEdits) st.userEdits.forEach((text, seq) => applyUserOne(seq, text))
       if (st.retractions) st.retractions.forEach((placeholder, seq) => stampHidden(seq))
       if (st.regenerates) st.regenerates.forEach((seq) => stampHidden(seq))
       return applied
@@ -910,6 +1052,31 @@ window.__ModuleLoader__.load({
         }).catch(() => {}).then(() => { setBusy(false) })
       }
 
+      // Editing an already-sent prompt reuses the same row anchor the rewind
+      // button stamps, so the host can resolve the exact event by seq.
+      function onEditUser(event) {
+        stampOwnRow(event)
+        if (busy || seq === undefined || !sid) return
+        setBusy(true)
+        get('/message?sessionId=' + encodeURIComponent(sid) + '&seq=' + encodeURIComponent(String(seq)))
+          .then((res) => {
+            if (res && res.ok === true) {
+              activeModal = {
+                type: 'edit-user',
+                sessionId: sid,
+                seq: res.seq,
+                text: res.text || '',
+                turn: typeof res.turn === 'number' ? res.turn : null,
+              }
+              emit()
+            } else {
+              try { post('/diag', { v: 'edit-user-rejected', sid: sid, seq: seq, res: res }) } catch (e) {}
+            }
+          })
+          .catch(() => {})
+          .then(() => setBusy(false))
+      }
+
       var stackChildren = []
       var factoryContent = null
       if (typeof props.renderFactorySlot === 'function') {
@@ -947,6 +1114,8 @@ window.__ModuleLoader__.load({
       actionsChildren.push(iconButton(copied ? L.copied : L.copy, 'tw-action',
         copied ? CHECK_ICON : COPY_ICON,
         { onClick: onCopy, side: 'bottom' }))
+      actionsChildren.push(iconButton(L.editUser, 'tw-action', EDIT_ICON,
+        { onClick: onEditUser, disabled: busy, side: 'bottom' }))
       actionsChildren.push(iconButton(L.rewind, 'tw-action tw-trigger', REWIND_ICON,
         { onClick: onRewind, disabled: busy, side: 'bottom' }))
 
@@ -1092,6 +1261,17 @@ window.__ModuleLoader__.load({
         })
       }
 
+      if (activeModal.type === 'edit-user') {
+        return React.createElement(EditDialog, {
+          sessionId: sid,
+          mode: 'user',
+          seq: activeModal.seq,
+          initialText: activeModal.text,
+          turn: activeModal.turn,
+          onClose: () => { activeModal = null; emit() },
+        })
+      }
+
       if (activeModal.type === 'settings') {
         return React.createElement(SettingsDialog, {
           sessionId: sid,
@@ -1105,6 +1285,9 @@ window.__ModuleLoader__.load({
     function EditDialog(props) {
       var sid = props.sessionId
       var seq = props.seq
+      // `mode: 'user'` edits an already-sent prompt. Everything else about the
+      // dialog is identical, so one component serves both sides of the turn.
+      var isUser = props.mode === 'user'
       var textState = React.useState(props.initialText)
       var text = textState[0]
       var setText = textState[1]
@@ -1112,15 +1295,16 @@ window.__ModuleLoader__.load({
       var submitting = subState[0]
       var setSubmitting = subState[1]
 
-      function onSave() {
+      function commit(resend) {
+        if (submitting) return
         setSubmitting(true)
-        post('/edit', { sessionId: sid, seq: seq, content: text }).then((res) => {
+        var path = isUser ? '/edit-user' : '/edit'
+        var body = isUser
+          ? { sessionId: sid, seq: seq, content: text, resend: resend === true }
+          : { sessionId: sid, seq: seq, content: text }
+        post(path, body).then((res) => {
           if (res && res.ok === true) {
             var st = getState(sid)
-            var edits = new Map(st.edits)
-            edits.set(seq, text)
-            var rets = new Map(st.retractions)
-            rets.delete(seq)
             var sources = new Map(st.sourceTexts || new Map())
             if (!sources.has(seq) && typeof props.initialText === 'string' && props.initialText !== '') {
               sources.set(seq, props.initialText)
@@ -1131,32 +1315,69 @@ window.__ModuleLoader__.load({
               resolvedTurn = res.turn
             }
             if (resolvedTurn !== null && resolvedTurn !== undefined && resolvedTurn !== '') turns.set(seq, Number(resolvedTurn))
-            writeState(sid, { edits: edits, retractions: rets, sourceTexts: sources, turnBySeq: turns })
+            if (isUser) {
+              var userEdits = new Map(st.userEdits || new Map())
+              userEdits.set(seq, text)
+              var userPatch = { userEdits: userEdits, sourceTexts: sources, turnBySeq: turns }
+              // The host opened a rewind range for the re-ask; mirror it so the
+              // old prompt and its reply leave the screen immediately instead of
+              // waiting for the next /state poll.
+              if (res.resend === true && res.restarted === true) {
+                userPatch.pending = { targetSeq: seq, markSeq: seq }
+              }
+              writeState(sid, userPatch)
+            } else {
+              var edits = new Map(st.edits)
+              edits.set(seq, text)
+              var rets = new Map(st.retractions)
+              rets.delete(seq)
+              writeState(sid, { edits: edits, retractions: rets, sourceTexts: sources, turnBySeq: turns })
+            }
             try { rwApply(sid) } catch (e) {}
             // A portaled action strip may not expose data-chat-turn. Re-read
             // /state, where the host resolves the turn from the event itself.
             if (resolvedTurn === null || resolvedTurn === undefined || resolvedTurn === '') {
               rwLoadState(sid).then(() => { try { rwApply(sid) } catch (e) {} })
             }
+            if (res.resend === true) {
+              try { window.dispatchEvent(new Event('tw-stamp')) } catch (e) {}
+            }
             props.onClose()
           }
         }).catch(() => {}).then(() => setSubmitting(false))
       }
 
+      var footer = [
+        React.createElement('button', { className: 'tw-btn', onClick: props.onClose, type: 'button', key: 'cancel' }, '取消'),
+      ]
+      if (isUser) {
+        footer.push(React.createElement('button', {
+          className: 'tw-btn',
+          onClick: () => commit(true),
+          disabled: submitting,
+          type: 'button',
+          key: 'resend',
+        }, submitting ? L.resending : L.resend))
+      }
+      footer.push(React.createElement('button', {
+        className: 'tw-btn tw-btn-primary',
+        onClick: () => commit(false),
+        disabled: submitting,
+        type: 'button',
+        key: 'save',
+      }, submitting ? L.saving : L.save))
+
       return React.createElement('div', { className: 'tw-modal-overlay', onClick: props.onClose },
         React.createElement('div', { className: 'tw-modal tw-edit-modal', onClick: (e) => e.stopPropagation() },
-          React.createElement('h3', { className: 'tw-modal-title' }, L.editTitle),
-          React.createElement('p', { className: 'tw-hint' }, L.editHint),
+          React.createElement('h3', { className: 'tw-modal-title' }, isUser ? L.editUserTitle : L.editTitle),
+          React.createElement('p', { className: 'tw-hint' }, isUser ? L.editUserHint : L.editHint),
           React.createElement('textarea', {
             className: 'tw-textarea',
             value: text,
             onChange: (e) => setText(e.target.value),
             rows: 8,
           }),
-          React.createElement('div', { className: 'tw-modal-footer' },
-            React.createElement('button', { className: 'tw-btn', onClick: props.onClose, type: 'button' }, '取消'),
-            React.createElement('button', { className: 'tw-btn tw-btn-primary', onClick: onSave, disabled: submitting, type: 'button' }, submitting ? L.saving : L.save)
-          )
+          React.createElement('div', { className: 'tw-modal-footer' }, footer)
         )
       )
     }

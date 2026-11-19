@@ -124,7 +124,10 @@ function turnOfSeq(session, seq) {
   return undefined
 }
 
-function assistantTextFromEvent(event) {
+// Both halves of a conversation carry their text differently: user/message puts
+// the blocks on `data.content`, assistant/message nests them under
+// `data.message.content`. One reader covers both.
+function messageTextFromEvent(event) {
   const data = event?.data
   if (!data) return ''
   if (typeof data.content === 'string') return data.content
@@ -145,6 +148,31 @@ function assistantTextFromEvent(event) {
       .join('')
   }
   return ''
+}
+
+const assistantTextFromEvent = messageTextFromEvent
+
+// Rewrite only the text of a message, keeping every non-text block in place.
+// An assistant reply is plain text, so replacing its content wholesale is fine;
+// a user prompt is not — it may carry image and file attachments that the model
+// must still receive.
+function contentWithText(content, text) {
+  if (typeof content === 'string') return [{ type: 'text', text }]
+  if (!Array.isArray(content)) return [{ type: 'text', text }]
+  const out = []
+  let placed = false
+  for (const block of content) {
+    if (block !== null && typeof block === 'object' && (block.type === 'text' || block.kind === 'text')) {
+      if (!placed) {
+        out.push({ ...block, text })
+        placed = true
+      }
+      continue
+    }
+    out.push(block)
+  }
+  if (!placed) out.unshift({ type: 'text', text })
+  return out
 }
 
 function imageRefInContent(content, attachmentId) {
@@ -221,7 +249,8 @@ export function apply(ctx) {
       st = {
         pending: null,
         ranges: [],
-        edits: new Map(), // seq -> newText
+        edits: new Map(), // seq -> newText (assistant replies)
+        userEdits: new Map(), // seq -> newText (user prompts)
         retractions: new Map(), // seq -> placeholderText
         regenerates: new Set(), // seq to omit from deriveMessages
         patched: false,
@@ -240,6 +269,7 @@ export function apply(ctx) {
     if (typeof original !== 'function') return
     const ranges = st.ranges
     const edits = st.edits
+    const userEdits = st.userEdits
     const retractions = st.retractions
     const regenerates = st.regenerates
     let cacheSig = ''
@@ -266,6 +296,12 @@ export function apply(ctx) {
 
         const message = this.deriveEventMessage(event)
         if (message != null) {
+          // An edited user prompt is swapped in place: the next turn must read
+          // the new words, but attachments must survive the rewrite.
+          if (message.role === 'user' && userEdits.has(seq)) {
+            out.push({ ...message, content: contentWithText(message.content, userEdits.get(seq)) })
+            continue
+          }
           if (message.role === 'assistant') {
             if (retractions.has(seq)) {
               const ph = retractions.get(seq) || globalConfig.placeholder || '.'
@@ -322,6 +358,8 @@ export function apply(ctx) {
         st.pending = null
       } else if (d.phase === 'edit' && typeof d.seq === 'number' && typeof d.content === 'string') {
         st.edits.set(d.seq, d.content)
+      } else if (d.phase === 'edit-user' && typeof d.seq === 'number' && typeof d.content === 'string') {
+        st.userEdits.set(d.seq, d.content)
       } else if (d.phase === 'retract' && typeof d.seq === 'number') {
         st.retractions.set(d.seq, d.placeholder || globalConfig.placeholder || '.')
       } else if (d.phase === 'regenerate' && typeof d.seq === 'number') {
@@ -420,6 +458,88 @@ export function apply(ctx) {
     writeJson(res, 200, { ok: true, seq, content, turn: turnOfSeq(session, seq) })
   }
 
+  async function onEditUser(req, res) {
+    if (req.method !== 'POST') return writeJson(res, 405, { ok: false, error: 'POST only' })
+    const body = await readJsonBody(req)
+    const session = resolveSession(body?.sessionId)
+    if (session === undefined) return writeJson(res, 404, { ok: false, error: 'unknown session' })
+    const seq = resolveSeq(session, body)
+    const content = typeof body?.content === 'string' ? body.content : undefined
+    if (seq === undefined || content === undefined) {
+      diagLine({ v: 'edit-user-reject', reason: 'bad-seq-or-content', sid: body?.sessionId ?? null, seq: body?.seq ?? null })
+      return writeJson(res, 400, { ok: false, error: 'bad seq or content' })
+    }
+    const target = eventAt(session, seq)
+    if (target === undefined || target.type !== 'user/message') {
+      diagLine({ v: 'edit-user-reject', reason: 'not-user-message', sid: session.id, seq, type: target?.type ?? null })
+      return writeJson(res, 400, { ok: false, error: 'target is not a user message' })
+    }
+    const originalText = messageTextFromEvent(target)
+    const st = stateFor(String(session.id))
+    rebuild(session, st)
+    ensurePatched(session, st)
+    st.userEdits.set(seq, content)
+    session.append('hook/invoked', { source: SOURCE, phase: 'edit-user', seq, content })
+    st.scannedSeq = session.seq
+    st.rev += 1
+
+    // "Edit and re-ask": the edited words become the next turn's prompt while
+    // the original prompt and its reply fall into a rewind range. Both the
+    // transcript and the model context then hold exactly one version of the
+    // question instead of a corrected copy above an answer to the old one.
+    let restarted = false
+    let failure
+    if (body?.resend === true) {
+      const tailSeq = session.seq - 1
+      const mark = session.append('hook/invoked', {
+        source: SOURCE, phase: 'mark', targetSeq: seq, tailSeq, preview: content.slice(0, 120),
+      })
+      st.pending = { targetSeq: seq, markSeq: mark.seq, tailSeq }
+      st.scannedSeq = session.seq
+      st.rev += 1
+      try {
+        const agent = agents.get(session.id)
+        if (agent === undefined) {
+          failure = 'agent-unavailable'
+        } else {
+          if (agent.status === 'running') agent.cancel({ kind: 'user' }, { keepInbox: true })
+          agent.followup({
+            id: `tw-reask-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            role: 'user',
+            content: [{ type: 'text', text: content }],
+          })
+          restarted = true
+        }
+      } catch (error) {
+        failure = String(error?.message || error).slice(0, 120)
+        console.error('[time-weaver] edit-user resend failed:', error)
+      }
+      // Nothing will run pre-step, so an uncommitted mark would leave a pending
+      // rewind banner on screen forever. Withdraw it instead.
+      if (!restarted) {
+        st.pending = null
+        session.append('hook/invoked', { source: SOURCE, phase: 'cancel', targetSeq: seq })
+        st.scannedSeq = session.seq
+        st.rev += 1
+      }
+    }
+
+    diagLine({
+      v: 'edit-user', sid: session.id, seq, resend: body?.resend === true, restarted, failure: failure ?? null,
+    })
+    writeJson(res, 200, {
+      ok: true,
+      seq,
+      content,
+      originalText,
+      role: 'user',
+      resend: body?.resend === true,
+      restarted,
+      error: failure,
+      turn: turnOfSeq(session, seq),
+    })
+  }
+
   async function onRetract(req, res) {
     if (req.method !== 'POST') return writeJson(res, 405, { ok: false, error: 'POST only' })
     const body = await readJsonBody(req)
@@ -508,14 +628,17 @@ export function apply(ctx) {
     const st = stateFor(String(session.id))
     rebuild(session, st)
     const ev = eventAt(session, targetSeq)
-    const text = st.edits.get(targetSeq) || assistantTextFromEvent(ev)
+    const isUser = ev?.type === 'user/message'
+    const edited = isUser ? st.userEdits : st.edits
+    const text = edited.has(targetSeq) ? edited.get(targetSeq) : messageTextFromEvent(ev)
     writeJson(res, 200, {
       ok: true,
       seq: targetSeq,
+      role: isUser ? 'user' : 'assistant',
       text,
       turn: turnOfSeq(session, targetSeq),
       isRetracted: st.retractions.has(targetSeq),
-      isEdited: st.edits.has(targetSeq),
+      isEdited: edited.has(targetSeq),
     })
   }
 
@@ -534,7 +657,13 @@ export function apply(ctx) {
       edits: Array.from(st.edits.entries()).map(([seq, content]) => ({
         seq,
         content,
-        originalText: assistantTextFromEvent(eventAt(session, seq)),
+        originalText: messageTextFromEvent(eventAt(session, seq)),
+        turn: turnOfSeq(session, seq),
+      })),
+      userEdits: Array.from(st.userEdits.entries()).map(([seq, content]) => ({
+        seq,
+        content,
+        originalText: messageTextFromEvent(eventAt(session, seq)),
         turn: turnOfSeq(session, seq),
       })),
       retractions: Array.from(st.retractions.entries()).map(([seq, placeholder]) => ({
@@ -619,6 +748,7 @@ export function apply(ctx) {
   ctx.effect(() => webServer.register({ kind: 'exact', path: API + '/mark', handler: withErrLog(onMark) }))
   ctx.effect(() => webServer.register({ kind: 'exact', path: API + '/cancel', handler: withErrLog(onCancel) }))
   ctx.effect(() => webServer.register({ kind: 'exact', path: API + '/edit', handler: withErrLog(onEditAssistant) }))
+  ctx.effect(() => webServer.register({ kind: 'exact', path: API + '/edit-user', handler: withErrLog(onEditUser) }))
   ctx.effect(() => webServer.register({ kind: 'exact', path: API + '/retract', handler: withErrLog(onRetract) }))
   ctx.effect(() => webServer.register({ kind: 'exact', path: API + '/regenerate', handler: withErrLog(onRegenerate) }))
   ctx.effect(() => webServer.register({ kind: 'exact', path: API + '/message', handler: withErrLog(onGetMessage) }))

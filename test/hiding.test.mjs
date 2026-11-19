@@ -205,7 +205,7 @@ function check(label, got, want) {
   console.log(`  ${ok ? 'ok  ' : 'FAIL'}  ${label.padEnd(52)} ${got.padEnd(9)} (want ${want})`)
 }
 
-const setState = (sid, patch) => states.set(sid, { pending: null, ranges: [], edits: new Map(), retractions: new Map(), regenerates: new Set(), sourceTexts: new Map(), ...patch })
+const setState = (sid, patch) => states.set(sid, { pending: null, ranges: [], edits: new Map(), userEdits: new Map(), retractions: new Map(), regenerates: new Set(), sourceTexts: new Map(), ...patch })
 
 console.log('rewind row hiding - regression against client.js\n')
 
@@ -365,6 +365,90 @@ check('no text was rewritten', flow[1].textContent, 'rendered answer with extras
 console.log('\nrepeated passes stay stable (no flicker)')
 D.rwApply('s'); D.rwApply('s')
 check('still hidden on later passes', shown(), '.H')
+
+// ------------------------------------------------- editing a user prompt --
+// A user bubble is stamped with its own seq and its text is located by content,
+// so an attachment sharing the bubble keeps rendering.
+function userBubbleRow(seq, key, text) {
+  const row = makeEl({ 'data-chat-flow-key': key, 'data-chat-flow-kind': 'user', 'data-xsj-seq': String(seq) })
+  const factory = makeEl({ class: 'tw-factory' })
+  const bubble = makeEl({ class: 'tw-bubble' })
+  const body = makeEl({ class: 'tw-text', __text: text })
+  bubble.appendChild(body)
+  factory.appendChild(bubble)
+  row.appendChild(factory)
+  row._factory = factory
+  row._bubble = bubble
+  row._bodyEl = body
+  return row
+}
+const editLayerIn = (el) => el.children.find((c) => c.getAttribute && c.getAttribute('data-tw-edit-body') === '1')
+
+console.log('\nediting a sent user prompt')
+flow = [userBubbleRow(0, 'u0', '原始提问'), ASST('a1')]
+setState('s', { userEdits: new Map([[0, '改过的提问']]), sourceTexts: new Map([[0, '原始提问']]) })
+D.twApplyTexts('s')
+check('the prompt text is rewritten', editLayerIn(flow[0]._bodyEl)?.textContent, '改过的提问')
+check('the bubble keeps its single text node', String(flow[0]._bubble.children.length), '1')
+
+console.log('\nuser prompt edit keeps attachments')
+flow = [userBubbleRow(0, 'u0', '看看这张图'), ASST('a1')]
+const attachedImage = makeEl({ __tag: 'IMG', class: 'tw-image' })
+flow[0]._bubble.appendChild(attachedImage)
+setState('s', { userEdits: new Map([[0, '看看这张截图']]), sourceTexts: new Map([[0, '看看这张图']]) })
+D.twApplyTexts('s')
+check('the attachment stays visible', String(attachedImage.style.display), 'undefined')
+check('the prompt text still changes', editLayerIn(flow[0]._bodyEl)?.textContent, '看看这张截图')
+
+console.log('\nuser prompt edit is idempotent')
+D.twApplyTexts('s')
+const userLayers = flow[0]._bodyEl.children.filter((c) => c.getAttribute && c.getAttribute('data-tw-edit-body') === '1')
+check('no duplicate edit layer', String(userLayers.length), '1')
+
+console.log('\nuser text stays literal (no markdown rendering)')
+flow = [userBubbleRow(0, 'u0', 'a*b*c'), ASST('a1')]
+setState('s', { userEdits: new Map([[0, '2*3=6']]), sourceTexts: new Map([[0, 'a*b*c']]) })
+D.twApplyTexts('s')
+const literalLayer = editLayerIn(flow[0]._bodyEl)
+check('asterisks survive verbatim', literalLayer?.textContent, '2*3=6')
+check('no MarkdownText render for user text', String(hasMarkdownNode(literalLayer && literalLayer.__reactNode)), 'false')
+
+console.log('\nuser prompt whose rendered text drifted still gets the edit')
+flow = [userBubbleRow(0, 'u0', '渲染后的样子'), ASST('a1')]
+setState('s', { userEdits: new Map([[0, '新内容']]), sourceTexts: new Map([[0, '完全不同的原文']]) })
+D.twApplyTexts('s')
+check('the text container is rewritten', editLayerIn(flow[0]._bodyEl)?.textContent, '新内容')
+check('the bubble chrome survives', String(flow[0]._bubble.style.display), 'undefined')
+check('the bubble keeps one child', String(flow[0]._factory.children.length), '1')
+
+console.log('\nreplaying an edit must not stack layers or hide the bubble')
+flow = [userBubbleRow(0, 'u0', '原始提问'), ASST('a1')]
+setState('s', { userEdits: new Map([[0, '改过的提问']]), sourceTexts: new Map([[0, '原始提问']]) })
+D.twApplyTexts('s')
+// The second pass can no longer find the original text: the edit layer holds
+// the only copy. It must resolve by its seq tag, not by content.
+D.twApplyTexts('s')
+D.twApplyTexts('s')
+const replayLayers = []
+const collectLayers = (el) => {
+  for (const kid of el.children) {
+    if (kid.getAttribute && kid.getAttribute('data-tw-edit-body') === '1') replayLayers.push(kid)
+    collectLayers(kid)
+  }
+}
+collectLayers(flow[0])
+check('only one edit layer after replays', String(replayLayers.length), '1')
+check('the bubble stays visible', String(flow[0]._bubble.style.display), 'undefined')
+check('the factory keeps one child', String(flow[0]._factory.children.length), '1')
+check('the text still reads the edit', replayLayers[0]?.textContent, '改过的提问')
+
+console.log('\nan unstamped prompt is never guessed at')
+const orphanRow = userBubbleRow(9, 'u9', '别的消息')
+orphanRow.removeAttribute('data-xsj-seq')
+flow = [orphanRow, ASST('a1')]
+setState('s', { userEdits: new Map([[0, '不该出现']]), sourceTexts: new Map([[0, '别的消息']]) })
+D.twApplyTexts('s')
+check('no edit layer is invented', String(orphanRow.children.length), '1')
 
 console.log('\nuser bubble width guards')
 check('stack has a definite width', String(/\.tw-stack\{[^}]*width:100%/.test(src)), 'true')
